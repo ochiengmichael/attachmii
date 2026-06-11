@@ -1,0 +1,11 @@
+{
+  "name": "Remix: AttachMee",
+  "description": "AttachMee is a modern full-stack job, attachment, internship, and recruitment platform that seamlessly connects students, job seekers, employers, and administrators.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
