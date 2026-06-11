@@ -66,6 +66,7 @@ export default function App() {
   const handleLoginSuccess = (token: string, loggedInUser: User) => {
     api.setToken(token);
     setUser(loggedInUser);
+    setView('dashboard');
   };
 
   const handleLogout = () => {

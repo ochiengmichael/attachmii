@@ -8,7 +8,7 @@ import jwt from 'jsonwebtoken';
 import { User, UserRole } from '../types.js';
 import { db } from './db.js';
 
-const JWT_SECRET = 'attachme_super_secret_session_key_2026';
+const JWT_SECRET = process.env.JWT_SECRET || 'attachme_super_secret_session_key_2026';
 
 export interface AuthenticatedRequest extends Request {
   user?: User;
