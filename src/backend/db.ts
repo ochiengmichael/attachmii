@@ -315,7 +315,19 @@ function generateSeedData(): Schema {
 }
 
 export class Database {
-  private data: Schema;
+  public data: Schema;
+  
+  // High-performance concurrency controls
+  private isSaving = false;
+  private isDirty = false;
+  private saveTimeout: NodeJS.Timeout | null = null;
+
+  // In-memory indexing for O(1) performance
+  private usersMap = new Map<string, any>();
+  private usersEmailMap = new Map<string, any>();
+  private companiesMap = new Map<string, Company>();
+  private jobsMap = new Map<string, Job>();
+  private applicationsMap = new Map<string, Application>();
 
   constructor() {
     this.data = {
@@ -330,6 +342,9 @@ export class Database {
       auditLogs: []
     };
     this.init();
+    
+    // Bind cleanup event listener to guarantee final synchronous save on process exit
+    this.registerProcessHandlers();
   }
 
   private init() {
@@ -344,20 +359,114 @@ export class Database {
       } catch (err) {
         console.error('Error parsing database. Restoring with seeds.', err);
         this.data = generateSeedData();
-        this.save();
+        this.saveSync();
       }
     } else {
       this.data = generateSeedData();
-      this.save();
+      this.saveSync();
+    }
+    
+    this.rebuildIndexes();
+  }
+
+  // Linear and incremental index builder
+  public rebuildIndexes() {
+    this.usersMap.clear();
+    this.usersEmailMap.clear();
+    this.companiesMap.clear();
+    this.jobsMap.clear();
+    this.applicationsMap.clear();
+
+    if (this.data.users) {
+      this.data.users.forEach(u => {
+        if (u && u.id) this.usersMap.set(u.id, u);
+        if (u && u.email) this.usersEmailMap.set(u.email.toLowerCase(), u);
+      });
+    }
+    if (this.data.companies) {
+      this.data.companies.forEach(c => {
+        if (c && c.id) this.companiesMap.set(c.id, c);
+      });
+    }
+    if (this.data.jobs) {
+      this.data.jobs.forEach(j => {
+        if (j && j.id) this.jobsMap.set(j.id, j);
+      });
+    }
+    if (this.data.applications) {
+      this.data.applications.forEach(a => {
+        if (a && a.id) this.applicationsMap.set(a.id, a);
+      });
     }
   }
 
+  // Non-blocking asynchronous file writing with de-duplication/throttling
   public save() {
+    this.isDirty = true;
+    if (this.saveTimeout) return;
+
+    // Debounce actual disk writing by 50ms to merge rapid concurrent writes
+    this.saveTimeout = setTimeout(() => {
+      this.saveTimeout = null;
+      this.flushToDisk();
+    }, 50);
+  }
+
+  private async flushToDisk() {
+    if (this.isSaving || !this.isDirty) return;
+    this.isSaving = true;
+    this.isDirty = false;
+
     try {
-      fs.writeFileSync(DB_FILE, JSON.stringify(this.data, null, 2), 'utf-8');
+      const tempFile = `${DB_FILE}.tmp`;
+      const serialized = JSON.stringify(this.data, null, 2);
+      
+      // Write file asynchronously (Non-blocking I/O)
+      await fs.promises.writeFile(tempFile, serialized, 'utf-8');
+      
+      // Atomic swap to absolutely prevent file corruption under load
+      await fs.promises.rename(tempFile, DB_FILE);
     } catch (err) {
-      console.error('Error writing to database file:', err);
+      console.error('Error writing database asynchronously:', err);
+      this.isDirty = true; // Mark dirty so it gets retried on next schedule
+    } finally {
+      this.isSaving = false;
+      // If data was updated while writing was in progress, schedule another save
+      if (this.isDirty) {
+        this.save();
+      }
     }
+  }
+
+  // Ensure synchronous fallback on server exit, avoiding data loss
+  public saveSync() {
+    try {
+      const tempFile = `${DB_FILE}.tmp`;
+      fs.writeFileSync(tempFile, JSON.stringify(this.data, null, 2), 'utf-8');
+      fs.renameSync(tempFile, DB_FILE);
+      this.isDirty = false;
+    } catch (err) {
+      console.error('Error writing database synchronously:', err);
+    }
+  }
+
+  private registerProcessHandlers() {
+    const handleExit = () => {
+      if (this.isDirty) {
+        console.log('Detected server shutdown. Flushing database state synchronously to disk...');
+        this.saveSync();
+      }
+    };
+
+    process.on('exit', handleExit);
+    process.on('SIGINT', () => {
+      handleExit();
+      process.exit(0);
+    });
+    process.on('SIGTERM', () => {
+      handleExit();
+      process.exit(0);
+    });
   }
 
   // Users Handlers
@@ -367,13 +476,27 @@ export class Database {
 
   public addUser(user: any) {
     this.data.users.push(user);
+    if (user.id) this.usersMap.set(user.id, user);
+    if (user.email) this.usersEmailMap.set(user.email.toLowerCase(), user);
     this.save();
   }
 
   public updateUser(id: string, updates: Partial<User>) {
+    const user = this.usersMap.get(id);
+    if (user) {
+      Object.assign(user, updates);
+      if (updates.email) {
+        // Re-index email if updated
+        this.usersEmailMap.set(updates.email.toLowerCase(), user);
+      }
+      this.save();
+      return user;
+    }
+    // Fallback if index wasn't updated
     const userIndex = this.data.users.findIndex(u => u.id === id);
     if (userIndex !== -1) {
       this.data.users[userIndex] = { ...this.data.users[userIndex], ...updates };
+      this.rebuildIndexes();
       this.save();
       return this.data.users[userIndex];
     }
@@ -387,13 +510,21 @@ export class Database {
 
   public addCompany(company: Company) {
     this.data.companies.push(company);
+    if (company.id) this.companiesMap.set(company.id, company);
     this.save();
   }
 
   public updateCompany(id: string, updates: Partial<Company>) {
+    const company = this.companiesMap.get(id);
+    if (company) {
+      Object.assign(company, updates);
+      this.save();
+      return company;
+    }
     const idx = this.data.companies.findIndex(c => c.id === id);
     if (idx !== -1) {
       this.data.companies[idx] = { ...this.data.companies[idx], ...updates };
+      this.rebuildIndexes();
       this.save();
       return this.data.companies[idx];
     }
@@ -407,13 +538,21 @@ export class Database {
 
   public addJob(job: Job) {
     this.data.jobs.push(job);
+    if (job.id) this.jobsMap.set(job.id, job);
     this.save();
   }
 
   public updateJob(id: string, updates: Partial<Job>) {
+    const job = this.jobsMap.get(id);
+    if (job) {
+      Object.assign(job, updates);
+      this.save();
+      return job;
+    }
     const idx = this.data.jobs.findIndex(j => j.id === id);
     if (idx !== -1) {
       this.data.jobs[idx] = { ...this.data.jobs[idx], ...updates };
+      this.rebuildIndexes();
       this.save();
       return this.data.jobs[idx];
     }
@@ -422,6 +561,7 @@ export class Database {
 
   public deleteJob(id: string) {
     this.data.jobs = this.data.jobs.filter(j => j.id !== id);
+    this.jobsMap.delete(id);
     this.save();
   }
 
@@ -432,18 +572,31 @@ export class Database {
 
   public addApplication(app: Application) {
     this.data.applications.push(app);
-    // Increment job applications count
-    const job = this.data.jobs.find(j => j.id === app.jobId);
+    if (app.id) this.applicationsMap.set(app.id, app);
+    
+    // Increment job applications count using index
+    const job = this.jobsMap.get(app.jobId);
     if (job) {
       job.applicantsCount = (job.applicantsCount || 0) + 1;
+    } else {
+      const dbJob = this.data.jobs.find(j => j.id === app.jobId);
+      if (dbJob) dbJob.applicantsCount = (dbJob.applicantsCount || 0) + 1;
     }
     this.save();
   }
 
   public updateApplication(id: string, updates: Partial<Application>) {
+    const app = this.applicationsMap.get(id);
+    if (app) {
+      Object.assign(app, updates);
+      app.updatedAt = new Date().toISOString();
+      this.save();
+      return app;
+    }
     const idx = this.data.applications.findIndex(a => a.id === id);
     if (idx !== -1) {
       this.data.applications[idx] = { ...this.data.applications[idx], ...updates, updatedAt: new Date().toISOString() };
+      this.rebuildIndexes();
       this.save();
       return this.data.applications[idx];
     }
